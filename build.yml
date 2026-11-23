@@ -1,0 +1,91 @@
+name: Compilar Pacheco's TV iPhone
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Abrir el proyecto (zip subido)
+        run: |
+          if [ ! -f project.yml ]; then
+            Z=$(ls PachecosTV-iOS*.zip 2>/dev/null | head -n 1)
+            if [ -z "$Z" ]; then Z=$(ls *.zip 2>/dev/null | head -n 1); fi
+            if [ -z "$Z" ]; then echo "Sube primero el zip del proyecto"; exit 1; fi
+            unzip -o -q "$Z" -d .
+            if [ ! -f project.yml ]; then
+              D=$(dirname "$(find . -maxdepth 3 -name project.yml | head -n 1)")
+              cp -R "$D"/. .
+            fi
+          fi
+          ls -la
+
+      - name: Elegir el Xcode más nuevo
+        run: |
+          X=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v -i beta | sort -V | tail -n 1)
+          if [ -n "$X" ]; then sudo xcode-select -s "$X/Contents/Developer"; fi
+          xcodebuild -version
+
+      - name: Herramientas
+        run: |
+          brew install xcodegen
+          xcodegen --version
+          pod --version
+
+      - name: Generar proyecto
+        run: |
+          xcodegen generate
+          # CocoaPods todavía no lee el formato 77 en todas sus versiones.
+          sed -i '' 's/objectVersion = 7[0-9];/objectVersion = 56;/' PachecosTV.xcodeproj/project.pbxproj
+          pod install --repo-update || (sudo gem install cocoapods && pod install --repo-update)
+
+      - name: Compilar
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace PachecosTV.xcworkspace \
+            -scheme PachecosTV \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build | tee xcodebuild.log | grep -E "error:|warning: unre|BUILD|\*\*" || true
+          test -d build/Build/Products/Release-iphoneos/PachecosTV.app || (grep -E "error:" -A3 xcodebuild.log | head -n 120; exit 1)
+
+      - name: Empaquetar IPA
+        run: |
+          rm -rf Payload && mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/PachecosTV.app Payload/
+          zip -qry PachecosTV.ipa Payload
+          ls -lh PachecosTV.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PachecosTV-iPhone
+          path: PachecosTV.ipa
+
+      - name: Publicar en Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "ios-1.6.23-${{ github.run_number }}" PachecosTV.ipa \
+            --title "Pacheco's TV iPhone 1.6.23 (${{ github.run_number }})" \
+            --notes "Descarga PachecosTV.ipa e instálala con Sideloadly desde tu PC."
+
+      - name: Errores de compilación
+        if: failure()
+        run: |
+          if [ -f xcodebuild.log ]; then grep -E "error:" -B1 -A3 xcodebuild.log | head -n 200; fi
